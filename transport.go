@@ -2981,9 +2981,22 @@ func (gz *gzipReader) Close() error {
 	return gz.body.Close()
 }
 
-// brReader lazily wraps a response body into an
-// io.ReadCloser, will call gzip.NewReader on first
-// call to read
+// brReaderPool and zstdDecoderPool recycle brotli and zstd decoders between
+// responses, the way gzipReaderPool does for gzip and under the same rule: a
+// decoder is recycled when its body has been read to EOF, never when the body
+// is closed, so a decoder that a blocked Read still holds is never handed to
+// another response. A brotli.Reader owns a 64KB input buffer and a ring buffer
+// the size of the stream's window, and a zstd.Decoder a history buffer the
+// size of the stream's window, up to zstdMaxWindowSize. These are the codings
+// servers pick for a browser's Accept-Encoding, so allocating the decoder per
+// response is most of what a client reading compressed bodies allocates.
+var (
+	brReaderPool    sync.Pool // of *brotli.Reader
+	zstdDecoderPool sync.Pool // of *zstd.Decoder
+)
+
+// brReader wraps a response body so it can lazily
+// set up a brotli.Reader on the first call to Read
 type brReader struct {
 	_    incomparable
 	body io.ReadCloser
@@ -2996,9 +3009,23 @@ func (br *brReader) Read(p []byte) (n int, err error) {
 		return 0, br.zerr
 	}
 	if br.zr == nil {
-		br.zr = brotli.NewReader(br.body)
+		if zr, ok := brReaderPool.Get().(*brotli.Reader); ok {
+			zr.Reset(br.body) // always returns nil
+			br.zr = zr
+		} else {
+			br.zr = brotli.NewReader(br.body)
+		}
 	}
-	return br.zr.Read(p)
+	n, err = br.zr.Read(p)
+	if err == io.EOF {
+		// Detach the reader before publishing it to the pool. Later Reads
+		// keep returning io.EOF.
+		zr := br.zr
+		br.zr = nil
+		br.zerr = io.EOF
+		brReaderPool.Put(zr)
+	}
+	return n, err
 }
 
 func (br *brReader) Close() error {
@@ -3073,7 +3100,7 @@ func (dr *deflateReader) Close() error {
 const zstdMaxWindowSize = 8 << 20
 
 // zstdReader wraps a response body so it can lazily
-// call zstd.NewReader on the first call to Read
+// set up a zstd.Decoder on the first call to Read
 type zstdReader struct {
 	body io.ReadCloser // underlying Response.Body
 	zr   *zstd.Decoder // lazily-initialized zstd reader
@@ -3085,22 +3112,37 @@ func (zs *zstdReader) Read(p []byte) (n int, err error) {
 		return 0, zs.zerr
 	}
 	if zs.zr == nil {
-		// A single decoder goroutine suffices for one response body and keeps the per-response cost low.
-		zs.zr, err = zstd.NewReader(zs.body, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(zstdMaxWindowSize))
+		if zr, ok := zstdDecoderPool.Get().(*zstd.Decoder); ok {
+			// Reset keeps the options the decoder was created with.
+			err = zr.Reset(zs.body)
+			zs.zr = zr
+		} else {
+			// A single decoder goroutine suffices for one response body and keeps the per-response cost low.
+			zs.zr, err = zstd.NewReader(zs.body, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(zstdMaxWindowSize))
+		}
 		if err != nil {
+			zs.zr = nil
 			zs.zerr = err
 			return 0, err
 		}
 	}
-	return zs.zr.Read(p)
+	n, err = zs.zr.Read(p)
+	if err == io.EOF {
+		// Detach the decoder before publishing it to the pool. Later Reads
+		// keep returning io.EOF.
+		zr := zs.zr
+		zs.zr = nil
+		zs.zerr = io.EOF
+		zstdDecoderPool.Put(zr)
+	}
+	return n, err
 }
 
+// Close closes the body and leaves the decoder alone. A decoder limited to
+// one goroutine decodes inside Read and holds nothing but memory, so one that
+// is not recycled is simply collected, and not touching it here keeps Close
+// safe to call while a Read is blocked on the body.
 func (zs *zstdReader) Close() error {
-	if zs.zr != nil {
-		zs.zr.Close() // zs.zr.Close() does not return a value, hence it's not checked for an error
-	}
-
-	// Close body and return error
 	return zs.body.Close()
 }
 
