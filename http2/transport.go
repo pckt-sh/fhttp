@@ -20,6 +20,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/textproto"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -331,6 +332,11 @@ type ClientConn struct {
 	hbuf             bytes.Buffer // HPACK encoder writes into this
 	henc             *hpack.Encoder
 	hencMaxTableSize uint32 // effective max dynamic table size currently applied to henc (guarded by mu, like henc)
+
+	// Scratch space for encodeHeaders, kept between requests so that putting
+	// a request's headers in order allocates nothing. Guarded by mu.
+	hdrFields        []requestHeaderField
+	hdrContentLength [1]string
 	highestPromiseID uint32 // highest promise id so far received from server
 
 	idleTimeout time.Duration // or 0 for never
@@ -1396,6 +1402,25 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 // awaitOpenSlotForRequest waits until len(streams) < maxConcurrentStreams.
 // Must hold cc.mu.
 func (cc *ClientConn) awaitOpenSlotForRequest(req *http.Request) error {
+	// The usual case is a connection with a slot free. Settle it here, so
+	// that only a request that has to wait pays for the state the wait
+	// shares with its cancellation goroutine.
+	cc.lastActive = time.Now()
+	if cc.closed || !cc.canTakeNewRequestLocked() {
+		return errClientConnUnusable
+	}
+	cc.lastIdle = time.Time{}
+	if int64(len(cc.streams))+1 <= int64(cc.maxConcurrentStreams) {
+		return nil
+	}
+
+	return cc.awaitOpenSlotForRequestSlow(req)
+}
+
+// awaitOpenSlotForRequestSlow is awaitOpenSlotForRequest for a connection that
+// has no slot free.
+// Must hold cc.mu.
+func (cc *ClientConn) awaitOpenSlotForRequestSlow(req *http.Request) error {
 	var waitingForConn chan struct{}
 	var waitingForConnErr error // guarded by cc.mu
 	for {
@@ -1769,6 +1794,13 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 		}
 	}
 
+	// enumerateHeaders runs twice, to count the header list size and then to
+	// write it, so the headers are put in order once, ahead of both passes.
+	kvs := cc.sortedRequestHeaders(req, addGzipHeader, contentLength)
+	// The list is scratch space that the next request on this connection
+	// reuses. Do not leave this request's header values reachable from it.
+	defer clear(kvs)
+
 	enumerateHeaders := func(f func(name, value string)) {
 		// 8.1.2.3 Request Pseudo-Header Fields
 		// The :path pseudo-header field includes the path and query parts of the
@@ -1822,40 +1854,8 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 			f("trailer", trailers)
 		}
 
-		// Should clone, because this function is called twice; to read and to write.
-		// If headers are added to the req, then headers would be added twice.
-		hdrs := req.Header.Clone()
-		if hdrs == nil {
-			hdrs = make(http.Header)
-		}
-		// Content-Length comes from the request, not from the caller's header map, as in net/http.
-		for k := range hdrs {
-			if strings.EqualFold(k, "content-length") {
-				delete(hdrs, k)
-			}
-		}
-		if shouldSendReqContentLength(req.Method, contentLength) {
-			hdrs["content-length"] = []string{strconv.FormatInt(contentLength, 10)}
-		}
-
-		// Does not include accept-encoding header if its defined in req.Header
-		if _, ok := hdrs["accept-encoding"]; !ok && addGzipHeader {
-			hdrs["accept-encoding"] = []string{"gzip, deflate, br, zstd"}
-		}
-
 		// Formats and writes headers with f function
 		var didUA bool
-		var kvs []http.HeaderKeyValues
-
-		if headerOrder, ok := hdrs[http.HeaderOrderKey]; ok {
-			order := make(map[string]int)
-			for i, v := range headerOrder {
-				order[v] = i
-			}
-			kvs, _ = hdrs.SortedKeyValuesBy(order, make(map[string]bool))
-		} else {
-			kvs, _ = hdrs.SortedKeyValues(make(map[string]bool))
-		}
 
 		for _, kv := range kvs {
 			if len(kv.Values) == 0 {
@@ -1956,6 +1956,110 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 	})
 
 	return cc.hbuf.Bytes(), nil
+}
+
+// requestHeaderField is one request header and where the request's
+// Header-Order: list puts it.
+type requestHeaderField struct {
+	Key    string
+	Values []string
+	order  int // index in the Header-Order: list, or -1 if the key is not in it
+}
+
+// defaultAcceptEncoding is what the Transport sends when it asks for a
+// compressed response on the caller's behalf. It is shared between requests
+// and must not be written to.
+var defaultAcceptEncoding = []string{"gzip, deflate, br, zstd"}
+
+// sortedRequestHeaders returns the header fields to send for req, in the
+// order they go on the wire: by position in the Header-Order: list if the
+// request has one, with the keys the list does not name after them in
+// lexicographic order, and lexicographically otherwise.
+//
+// Content-Length comes from the request, not from the caller's header map, as
+// in net/http, and Accept-Encoding is added if the Transport asks for
+// compression itself. The caller's header map is not modified.
+//
+// The returned slice is cc.hdrFields, which the next call overwrites.
+//
+// requires cc.mu be held.
+func (cc *ClientConn) sortedRequestHeaders(req *http.Request, addGzipHeader bool, contentLength int64) []requestHeaderField {
+	headerOrder, ordered := req.Header[http.HeaderOrderKey]
+
+	fields := cc.hdrFields[:0]
+	for k, vv := range req.Header {
+		if strings.EqualFold(k, "content-length") {
+			continue
+		}
+		fields = append(fields, requestHeaderField{Key: k, Values: vv, order: -1})
+	}
+	if shouldSendReqContentLength(req.Method, contentLength) {
+		cc.hdrContentLength[0] = strconv.FormatInt(contentLength, 10)
+		fields = append(fields, requestHeaderField{Key: "content-length", Values: cc.hdrContentLength[:], order: -1})
+	}
+	// Does not include accept-encoding header if its defined in req.Header
+	if _, ok := req.Header["accept-encoding"]; !ok && addGzipHeader {
+		fields = append(fields, requestHeaderField{Key: "accept-encoding", Values: defaultAcceptEncoding, order: -1})
+	}
+
+	if ordered {
+		for i := range fields {
+			fields[i].order = headerOrderIndex(headerOrder, fields[i].Key)
+		}
+	}
+
+	slices.SortFunc(fields, func(a, b requestHeaderField) int {
+		switch {
+		case a.order < 0 && b.order < 0:
+			return strings.Compare(a.Key, b.Key)
+		case a.order < 0:
+			return 1
+		case b.order < 0:
+			return -1
+		default:
+			return a.order - b.order
+		}
+	})
+
+	cc.hdrFields = fields
+
+	return fields
+}
+
+// headerOrderIndex returns the position of key in a Header-Order: list, or -1
+// if the list does not name it. The list is matched against the lower-cased
+// key, and the last entry wins if the list names a key twice.
+//
+// It scans the list instead of indexing it by key: the list is a handful of
+// short strings, and a map of them would have to be built for every request.
+func headerOrderIndex(headerOrder []string, key string) int {
+	for i := len(headerOrder) - 1; i >= 0; i-- {
+		if equalsLowered(headerOrder[i], key) {
+			return i
+		}
+	}
+
+	return -1
+}
+
+// equalsLowered reports whether s is key with its ASCII letters lower-cased.
+// A header name is ASCII: encodeHeaders has rejected any that is not by the
+// time the headers are sorted.
+func equalsLowered(s, key string) bool {
+	if len(s) != len(key) {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if s[i] != c {
+			return false
+		}
+	}
+
+	return true
 }
 
 // shouldSendReqContentLength reports whether the http2.Transport should send
